@@ -2,8 +2,11 @@
   "refresh_interval_sec": 10,
   "session_scan_limit": 120,
   "aliases_file": "session_aliases.json",
+  "session_bindings_file": "session_bindings.json",
   "credentials_file": "credentials.enc.json",
   "send_mode": "stdin",
+  "probe_timeout_sec": 20,
+  "probe_message_template": "请只回复：{token}",
   "session_overrides": {},
   "dashboard": {
     "agent_types": ["codex", "claude", "droid"],

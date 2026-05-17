@@ -27,9 +27,12 @@ const statusFilterMap = {
 };
 const matchSourceLabels = {
   manual_override: "手动覆盖",
+  probe_binding: "主动探测",
   cmux_tag: "CMUX tag",
   command_resume: "resume 命令",
+  cwd_unique: "目录唯一",
   cwd_time: "目录/时间",
+  ambiguous: "候选不唯一",
   none: "未匹配",
 };
 
@@ -438,6 +441,30 @@ function makeCard(agent) {
     feedback.textContent = msg || "";
     feedback.className = `action-feedback ${cls}`.trim();
   };
+
+  const probeBtn = node.querySelector(".probe-btn");
+  if (agent.agent_type !== "codex" || !agent.interactive_supported || !agent.cmux_surface_id) {
+    probeBtn.disabled = true;
+    probeBtn.title = "当前 Agent 不支持 CMUX session 探测";
+  } else {
+    probeBtn.onclick = async () => {
+      if (probeBtn.disabled) return;
+      probeBtn.disabled = true;
+      const origText = probeBtn.textContent;
+      probeBtn.textContent = "识别中...";
+      setFeedback("已发送探测消息，正在查找 session...", "");
+      try {
+        const res = await postJson("/api/probe-session", { agent_id: agent.id });
+        setFeedback(`已绑定 session: ${res.session_id || "unknown"}`, "ok");
+        await loadDashboard();
+      } catch (err) {
+        setFeedback(String(err.message || err), "err");
+      } finally {
+        probeBtn.disabled = false;
+        probeBtn.textContent = origText;
+      }
+    };
+  }
 
   const renameBtn = node.querySelector(".rename-btn");
   renameBtn.onclick = async () => {

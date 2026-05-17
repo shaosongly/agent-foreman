@@ -42,8 +42,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "refresh_interval_sec": 10,
     "session_scan_limit": 120,
     "aliases_file": str(BASE_DIR / "session_aliases.json"),
+    "session_bindings_file": str(BASE_DIR / "session_bindings.json"),
     "credentials_file": str(BASE_DIR / "credentials.enc.json"),
     "send_mode": "stdin",
+    "probe_timeout_sec": 20,
+    "probe_message_template": "请只回复：{token}",
     "managed_hosts": [],
     "dashboard": {
         "agent_types": ["codex", "claude", "droid"],
@@ -1437,6 +1440,73 @@ def apply_session_overrides(
     return applied
 
 
+def _binding_keys_for_values(surface_id: str | None = None, surface_ref: str | None = None) -> list[str]:
+    keys = []
+    if surface_id:
+        keys.append(f"cmux_surface:{surface_id}")
+    if surface_ref:
+        keys.append(f"cmux_surface_ref:{surface_ref}")
+    return keys
+
+
+def session_binding_keys_for_proc(proc: ProcInfo) -> list[str]:
+    return _binding_keys_for_values(proc.cmux_surface_id, proc.cmux_surface_ref)
+
+
+def session_binding_keys_for_agent(agent: dict[str, Any]) -> list[str]:
+    return _binding_keys_for_values(agent.get("cmux_surface_id"), agent.get("cmux_surface_ref"))
+
+
+def read_session_bindings(config: dict[str, Any]) -> dict[str, Any]:
+    data = read_json_file(config.get("session_bindings_file", BASE_DIR / "session_bindings.json"), {})
+    return data if isinstance(data, dict) else {}
+
+
+def write_session_binding(config: dict[str, Any], agent: dict[str, Any], session_id: str, probe_token: str) -> dict[str, Any]:
+    bindings = read_session_bindings(config)
+    keys = session_binding_keys_for_agent(agent)
+    if not keys:
+        raise ValueError("Agent does not expose a CMUX surface for session binding")
+    record = {
+        "session_id": session_id,
+        "verified_at": iso_now(),
+        "method": "probe",
+        "probe_token": probe_token,
+        "pid": agent.get("pid"),
+        "cwd": agent.get("cwd"),
+        "cmux_workspace_id": agent.get("cmux_workspace_id"),
+        "cmux_surface_id": agent.get("cmux_surface_id"),
+        "cmux_surface_ref": agent.get("cmux_surface_ref"),
+    }
+    for key in keys:
+        bindings[key] = record
+    write_json_file(config.get("session_bindings_file", BASE_DIR / "session_bindings.json"), bindings)
+    return record
+
+
+def apply_session_bindings(processes: list[ProcInfo], config: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    bindings = read_session_bindings(config)
+    if not bindings:
+        return {}
+    applied: dict[int, dict[str, Any]] = {}
+    for proc in processes:
+        if proc.session_id:
+            continue
+        for key in session_binding_keys_for_proc(proc):
+            record = bindings.get(key)
+            if not isinstance(record, dict) or not record.get("session_id"):
+                continue
+            if record.get("pid") is not None and int(record.get("pid")) != proc.pid:
+                continue
+            if record.get("cwd") and proc.cwd and record.get("cwd") != proc.cwd:
+                continue
+            proc.session_id = str(record["session_id"])
+            proc.match_source = "probe_binding"
+            applied[proc.pid] = record
+            break
+    return applied
+
+
 def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     by_id = {s.get("session_id"): s for s in sessions if s.get("session_id")}
     by_cwd: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1455,8 +1525,6 @@ def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) ->
             out[proc.pid] = session
             used.add(proc.session_id)
             continue
-        if proc.agent_type == "codex" and (proc.cmux_workspace_id or proc.cmux_surface_ref):
-            continue
         cwd = proc.cwd
         if not cwd:
             continue
@@ -1465,6 +1533,16 @@ def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) ->
             if s.get("session_id") not in used and s.get("session_kind") != "approval_review"
         ]
         if not candidates:
+            continue
+        if proc.agent_type == "codex" and (proc.cmux_workspace_id or proc.cmux_surface_id or proc.cmux_surface_ref):
+            if len(candidates) != 1:
+                proc.match_source = "ambiguous"
+                continue
+            best = candidates[0]
+            out[proc.pid] = best
+            proc.match_source = "cwd_unique"
+            if best.get("session_id"):
+                used.add(best["session_id"])
             continue
         best = min(
             candidates,
@@ -1639,6 +1717,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
             cmux_context = get_cmux_context(proc.pid) or {}
             proc.cmux_workspace_id = proc.cmux_workspace_id or cmux_context.get("workspace_id")
             proc.cmux_surface_id = proc.cmux_surface_id or cmux_context.get("surface_id")
+    apply_session_bindings(procs, config)
     apply_session_overrides(procs, config, cmux_workspace_names)
 
     codex_procs = [p for p in procs if p.agent_type == "codex"]
@@ -1687,7 +1766,11 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
             session = droid_match.get(proc.pid)
         else:
             session = None
-        if not session and "+" not in proc.stat and proc.cpu < 0.2:
+        cmux_context = get_cmux_context(proc.pid) if host_cfg.get("mode") == "local" else None
+        cmux_workspace_id = (cmux_context or {}).get("workspace_id") or proc.cmux_workspace_id
+        cmux_surface_id = (cmux_context or {}).get("surface_id") or proc.cmux_surface_id
+        has_cmux_identity = proc.agent_type == "codex" and (proc.cmux_workspace_id or cmux_workspace_id or proc.cmux_surface_ref or cmux_surface_id)
+        if not session and not has_cmux_identity and "+" not in proc.stat and proc.cpu < 0.2:
             continue
         cwd = proc.cwd or (session or {}).get("cwd")
         if cwd not in branch_cache:
@@ -1700,9 +1783,6 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
         parent_app = None
         if host_cfg.get("mode") == "local" and _IS_MACOS:
             parent_app = detect_parent_application(proc.pid)
-        cmux_context = get_cmux_context(proc.pid) if host_cfg.get("mode") == "local" else None
-        cmux_workspace_id = (cmux_context or {}).get("workspace_id") or proc.cmux_workspace_id
-        cmux_surface_id = (cmux_context or {}).get("surface_id") or proc.cmux_surface_id
         cmux_workspace_name = cmux_workspace_names.get(cmux_workspace_id or "")
         interactive_supported = bool(
             send_template
@@ -1713,7 +1793,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
         agents.append(
             {
                 "id": f"{host_id}:{proc.agent_type}:{proc.pid}",
-                "rename_key": f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or (cwd or proc.pid)}",
+                "rename_key": f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or proc.session_id or (cwd or proc.pid)}",
                 "host": host_cfg["name"],
                 "host_id": host_id,
                 "host_mode": host_cfg.get("mode", "local"),
@@ -1721,7 +1801,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "pid": proc.pid,
                 "ppid": proc.ppid,
                 "project": os.path.basename(cwd) if cwd else None,
-                "display_name": proc.override_alias or aliases.get(f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or (cwd or proc.pid)}"),
+                "display_name": proc.override_alias or aliases.get(f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or proc.session_id or (cwd or proc.pid)}"),
                 "cwd": cwd,
                 "branch": branch,
                 "status": status,
@@ -1741,7 +1821,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "command": truncate(proc.args, 240),
                 "recent_output": (session or {}).get("recent_output", ""),
                 "pending_items": (session or {}).get("pending_items", []),
-                "session_id": (session or {}).get("session_id"),
+                "session_id": (session or {}).get("session_id") or proc.session_id,
                 "session_kind": (session or {}).get("session_kind"),
                 "needs_user": bool((session or {}).get("needs_user")),
                 "has_result": bool((session or {}).get("has_result")),
@@ -2306,6 +2386,71 @@ def send_agent_action(store: SnapshotStore, agent_id: str, message: str) -> dict
     return {"agent_id": agent_id, "message": message, **result}
 
 
+def find_codex_session_by_probe(
+    config: dict[str, Any],
+    host_cfg: dict[str, Any],
+    token: str,
+    since_ts: float,
+) -> dict[str, Any] | None:
+    base_paths = config.get("paths", {})
+    host_paths = {**base_paths, **host_cfg.get("paths", {})}
+    root = host_paths.get("codex_sessions")
+    deadline = utc_now_ts() + int(config.get("probe_timeout_sec", 20))
+    while utc_now_ts() <= deadline:
+        matches: list[dict[str, Any]] = []
+        for path in get_recent_files(root, "*.jsonl", config.get("session_scan_limit", 120), True):
+            try:
+                if path.stat().st_mtime < since_ts - 5:
+                    continue
+                raw = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if token not in raw:
+                continue
+            session = parse_codex_session(path)
+            if session and session.get("session_id"):
+                matches.append(session)
+        if matches:
+            matches.sort(key=lambda s: s.get("heartbeat_ts") or 0, reverse=True)
+            return matches[0]
+        time.sleep(0.5)
+    return None
+
+
+def probe_agent_session(store: SnapshotStore, agent_id: str) -> dict[str, Any]:
+    agent, host_cfg = store.find_agent(agent_id)
+    if not agent or not host_cfg:
+        raise ValueError("Agent not found")
+    if host_cfg.get("mode", "local") != "local":
+        raise ValueError("Session probe is only supported for local hosts")
+    if agent.get("agent_type") != "codex":
+        raise ValueError("Session probe is only supported for Codex agents")
+    if not agent.get("cmux_workspace_id") or not agent.get("cmux_surface_id"):
+        raise ValueError("Session probe requires CMUX workspace and surface ids")
+
+    token = f"AF-PROBE-{secrets.token_hex(3).upper()}"
+    template = str(store.config.get("probe_message_template") or "请只回复：{token}")
+    message = template.format(token=token)
+    since_ts = utc_now_ts()
+    send_result = send_agent_action(store, agent_id, message)
+    if send_result.get("returncode") != 0:
+        return {"ok": False, "token": token, "send_result": send_result, "error": send_result.get("stderr") or "probe send failed"}
+
+    session = find_codex_session_by_probe(store.config, host_cfg, token, since_ts)
+    if not session:
+        return {"ok": False, "token": token, "send_result": send_result, "error": "probe token was not found in recent Codex session files"}
+
+    binding = write_session_binding(store.config, agent, str(session["session_id"]), token)
+    store.refresh()
+    return {
+        "ok": True,
+        "token": token,
+        "send_result": send_result,
+        "session_id": session["session_id"],
+        "binding": binding,
+    }
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     store: SnapshotStore | None = None
 
@@ -2407,6 +2552,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
             return
 
+        if parsed.path == "/api/probe-session":
+            agent_id = str(data.get("agent_id", "")).strip()
+            if not agent_id:
+                self._send_json({"ok": False, "error": "agent_id required"}, 400)
+                return
+            try:
+                result = probe_agent_session(self.store, agent_id)
+                self._send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+            return
+
         if parsed.path == "/api/hosts/save":
             try:
                 host_store = ManagedHostStore(self.store.config, self.store.vault)
@@ -2479,6 +2636,7 @@ def load_config(path: str | None) -> dict[str, Any]:
         if "managed_hosts" in user:
             config["managed_hosts"] = user["managed_hosts"]
     config["aliases_file"] = resolve_relative_path(config_dir, config.get("aliases_file")) or str(BASE_DIR / "session_aliases.json")
+    config["session_bindings_file"] = resolve_relative_path(config_dir, config.get("session_bindings_file")) or str(BASE_DIR / "session_bindings.json")
     config["credentials_file"] = resolve_relative_path(config_dir, config.get("credentials_file")) or str(BASE_DIR / "credentials.enc.json")
     config["_config_path"] = str(config_path)
     config["_credentials_path"] = str(Path(config["credentials_file"]))

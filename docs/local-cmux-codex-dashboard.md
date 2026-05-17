@@ -41,16 +41,21 @@ Codex 进程会优先从 CMUX 的进程视图里读取 `workspace:<id>:tag:codex
 1. `session_overrides` 手动覆盖。
 2. CMUX tag：`workspace:<id>:tag:codex.<session_id>`。
 3. 命令行：`codex resume <session_id>`。
-4. 非 CMUX 场景下的 cwd/start time 兜底匹配。
+4. 主动探测后保存的 `session_bindings`。
+5. CMUX Codex 的唯一 cwd 候选兜底。
+6. 非 CMUX 场景下的 cwd/start time 兜底匹配。
 
-对本机 CMUX Codex 来说，如果没有可靠的 session id，就不会仅凭 cwd/start time 猜测 session。这样多个 Codex 都在同一个目录下运行时，宁可只显示进程状态，也避免把某个 surface 的会话内容贴到另一个 Agent 卡片上。
+对本机 CMUX Codex 来说，如果没有可靠的 session id，只会在同一个 cwd 下只有一个可用 session 候选时自动兜底。多个 Codex 都在同一个目录下运行时，会标成候选不唯一，宁可只显示进程状态，也避免把某个 surface 的会话内容贴到另一个 Agent 卡片上。
 
 卡片的“监工细节”会显示匹配来源：
 
 - `手动覆盖`
+- `主动探测`
 - `CMUX tag`
 - `resume 命令`
+- `目录唯一`
 - `目录/时间`
+- `候选不唯一`
 - `未匹配`
 
 ### 辅助进程过滤
@@ -129,6 +134,9 @@ http://127.0.0.1:8787
 ```json
 {
   "send_mode": "cmux",
+  "session_bindings_file": "session_bindings.json",
+  "probe_timeout_sec": 20,
+  "probe_message_template": "请只回复：{token}",
   "session_overrides": {},
   "dashboard": {
     "agent_types": ["codex"],
@@ -161,6 +169,18 @@ http://127.0.0.1:8787
 页面顶部也会提供工具类型 chip，用来临时开关当前浏览器里的展示状态；这个临时选择会保存在浏览器 `localStorage` 里。
 
 `config.json` 被 `.gitignore` 忽略，可以按本机情况修改。
+
+### 主动探测匹配
+
+如果某个 Codex 卡片没有可靠匹配到 session，或者你觉得它显示的最近内容不对，可以点卡片上的 `重新识别`。它会对这个 CMUX surface 发送一条短消息：
+
+```text
+请只回复：AF-PROBE-XXXXXX
+```
+
+然后 dashboard 会在最近的 Codex session 文件里查找这个唯一 token。找到后会把当前 CMUX surface 和 session id 写入 `session_bindings.json`，后续刷新页面或重启 dashboard 都可以复用这个绑定。
+
+这个动作有轻微侵入性，因为它会在 Codex 会话里插入一条探测消息。它是显式按钮，不会默认自动对所有 Agent 执行。发送目标仍然永远以 CMUX workspace/surface 为准，探测绑定只影响卡片展示哪个 session 内容。
 
 ### 手动覆盖匹配
 

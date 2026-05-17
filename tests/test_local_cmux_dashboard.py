@@ -77,6 +77,8 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn("chip.disabled = count === 0", js)
         self.assertIn("matchSourceLabels", js)
         self.assertIn("agent.cmux_surface_ref", js)
+        self.assertIn("/api/probe-session", js)
+        self.assertIn("probe_binding", js)
         css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         self.assertIn("repeat(auto-fit", css)
         self.assertIn("980px", css)
@@ -92,6 +94,8 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn("codex-auto-review", doc)
         self.assertIn("Markdown", doc)
         self.assertIn("session_overrides", doc)
+        self.assertIn("session_bindings", doc)
+        self.assertIn("主动探测", doc)
         self.assertIn("CMUX tag", doc)
 
     def test_local_cmux_example_defaults_to_codex_only(self):
@@ -100,6 +104,7 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn('"agent_types": ["codex"]', config)
         self.assertIn('"hide_empty_tools": true', config)
         self.assertIn('"session_overrides": {}', config)
+        self.assertIn('"session_bindings_file": "session_bindings.json"', config)
 
 
 if __name__ == "__main__":

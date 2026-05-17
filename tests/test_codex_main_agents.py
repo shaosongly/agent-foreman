@@ -145,7 +145,7 @@ class CodexMainAgentTests(unittest.TestCase):
 
         self.assertEqual(matched[1]["session_id"], "review-session")
 
-    def test_match_sessions_does_not_guess_cmux_codex_session_by_cwd(self):
+    def test_match_sessions_does_not_guess_ambiguous_cmux_codex_session_by_cwd(self):
         proc = monitor_server.ProcInfo(
             pid=1,
             ppid=0,
@@ -163,7 +163,44 @@ class CodexMainAgentTests(unittest.TestCase):
         )
         sessions = [
             {
-                "session_id": "other-session",
+                "session_id": "other-session-1",
+                "session_kind": "main",
+                "cwd": "/repo",
+                "start_ts": 1002,
+                "heartbeat_ts": 1002,
+            },
+            {
+                "session_id": "other-session-2",
+                "session_kind": "main",
+                "cwd": "/repo",
+                "start_ts": 1003,
+                "heartbeat_ts": 1003,
+            }
+        ]
+
+        matched = monitor_server.match_sessions([proc], sessions)
+
+        self.assertNotIn(1, matched)
+
+    def test_match_sessions_uses_unique_cmux_codex_cwd_fallback(self):
+        proc = monitor_server.ProcInfo(
+            pid=1,
+            ppid=0,
+            stat="S+",
+            etimes=100,
+            cpu=0.0,
+            mem=0.0,
+            args="codex",
+            cwd="/repo",
+            agent_type="codex",
+            start_ts=1000,
+            session_id=None,
+            cmux_workspace_id="workspace-123",
+            cmux_surface_ref="surface:2",
+        )
+        sessions = [
+            {
+                "session_id": "only-session",
                 "session_kind": "main",
                 "cwd": "/repo",
                 "start_ts": 1002,
@@ -173,7 +210,46 @@ class CodexMainAgentTests(unittest.TestCase):
 
         matched = monitor_server.match_sessions([proc], sessions)
 
+        self.assertEqual(matched[1]["session_id"], "only-session")
+        self.assertEqual(proc.match_source, "cwd_unique")
+
+    def test_match_sessions_marks_ambiguous_cmux_codex_cwd_without_guessing(self):
+        proc = monitor_server.ProcInfo(
+            pid=1,
+            ppid=0,
+            stat="S+",
+            etimes=100,
+            cpu=0.0,
+            mem=0.0,
+            args="codex",
+            cwd="/repo",
+            agent_type="codex",
+            start_ts=1000,
+            session_id=None,
+            cmux_workspace_id="workspace-123",
+            cmux_surface_ref="surface:2",
+        )
+        sessions = [
+            {
+                "session_id": "first-session",
+                "session_kind": "main",
+                "cwd": "/repo",
+                "start_ts": 1002,
+                "heartbeat_ts": 1002,
+            },
+            {
+                "session_id": "second-session",
+                "session_kind": "main",
+                "cwd": "/repo",
+                "start_ts": 1003,
+                "heartbeat_ts": 1003,
+            },
+        ]
+
+        matched = monitor_server.match_sessions([proc], sessions)
+
         self.assertNotIn(1, matched)
+        self.assertEqual(proc.match_source, "ambiguous")
 
     def test_session_override_wins_by_workspace_name(self):
         proc = monitor_server.ProcInfo(
@@ -210,6 +286,42 @@ class CodexMainAgentTests(unittest.TestCase):
         self.assertEqual(proc.session_id, "manual-session")
         self.assertEqual(proc.match_source, "manual_override")
         self.assertEqual(proc.override_alias, "知识库构建")
+
+    def test_session_binding_reuses_probe_result_for_same_pid_and_surface(self):
+        proc = monitor_server.ProcInfo(
+            pid=42,
+            ppid=0,
+            stat="S+",
+            etimes=100,
+            cpu=0.0,
+            mem=0.0,
+            args="codex",
+            cwd="/repo",
+            agent_type="codex",
+            start_ts=1000,
+            session_id=None,
+            cmux_surface_id="surface-uuid",
+            cmux_workspace_id="workspace-uuid",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bindings_file = Path(tmpdir) / "session_bindings.json"
+            monitor_server.write_session_binding(
+                {"session_bindings_file": str(bindings_file)},
+                {
+                    "pid": 42,
+                    "cwd": "/repo",
+                    "cmux_surface_id": "surface-uuid",
+                    "cmux_workspace_id": "workspace-uuid",
+                },
+                "probe-session",
+                "AF-PROBE-123456",
+            )
+
+            applied = monitor_server.apply_session_bindings([proc], {"session_bindings_file": str(bindings_file)})
+
+        self.assertEqual(applied[42]["session_id"], "probe-session")
+        self.assertEqual(proc.session_id, "probe-session")
+        self.assertEqual(proc.match_source, "probe_binding")
 
     def test_parse_codex_session_marks_final_answer_as_result_to_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:

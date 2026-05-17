@@ -3,6 +3,7 @@ config.json
 credentials.enc.json
 credentials.enc.json.bak
 session_aliases.json
+session_bindings.json
 
 # 运行时文件
 foreman.log
