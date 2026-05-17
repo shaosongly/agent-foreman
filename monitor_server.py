@@ -1029,18 +1029,20 @@ def parse_codex_session(path: Path) -> dict[str, Any] | None:
         if not pending and obj.get("type") == "response_item":
             pending = extract_codex_pending(obj.get("payload", {}))
 
+    latest_agent_after_user = bool(last_agent_ts and (last_user_ts is None or last_agent_ts >= last_user_ts))
     needs_user = False
-    for pattern in DEFAULT_CONFIG["status"]["needs_input_patterns"]:
-        try:
-            if recent_text and re.search(pattern, recent_text, re.IGNORECASE):
-                needs_user = True
-                break
-        except re.error:
-            continue
+    if latest_agent_after_user:
+        for pattern in DEFAULT_CONFIG["status"]["needs_input_patterns"]:
+            try:
+                if recent_text and re.search(pattern, recent_text, re.IGNORECASE):
+                    needs_user = True
+                    break
+            except re.error:
+                continue
     has_result = bool(
         recent_text
         and last_agent_ts
-        and (last_user_ts is None or last_agent_ts >= last_user_ts)
+        and latest_agent_after_user
         and last_agent_phase == "final_answer"
     )
 

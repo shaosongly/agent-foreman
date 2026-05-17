@@ -369,6 +369,67 @@ class CodexMainAgentTests(unittest.TestCase):
         self.assertTrue(session["has_result"])
         self.assertEqual(session["pending_items"], ["有新结果待查看"])
 
+    def test_parse_codex_session_clears_needs_user_after_new_user_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-running.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-17T03:00:00.000Z",
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "main-session",
+                                    "cwd": "/repo",
+                                    "source": "cli",
+                                    "thread_source": "user",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-17T03:01:00.000Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "agent_message",
+                                    "message": "请确认是否需要我继续？",
+                                    "phase": "final_answer",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-17T03:02:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "task_complete"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-17T03:03:00.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "task_started"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-05-17T03:03:01.000Z",
+                                "type": "event_msg",
+                                "payload": {"type": "user_message", "message": "继续做"},
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            session = monitor_server.parse_codex_session(path)
+
+        self.assertFalse(session["needs_user"])
+        self.assertFalse(session["has_result"])
+        self.assertEqual(session["pending_items"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
