@@ -43,7 +43,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "session_scan_limit": 120,
     "aliases_file": str(BASE_DIR / "session_aliases.json"),
     "credentials_file": str(BASE_DIR / "credentials.enc.json"),
+    "send_mode": "stdin",
     "managed_hosts": [],
+    "dashboard": {
+        "agent_types": ["codex", "claude", "droid"],
+        "hide_empty_tools": True,
+    },
     "status": {
         "busy_cpu_threshold": 20.0,
         "active_heartbeat_sec": 120,
@@ -373,7 +378,7 @@ class ManagedHostStore:
             raise ValueError("Port must be an integer") from exc
         if port < 1 or port > 65535:
             raise ValueError("Port must be between 1 and 65535")
-        if payload.get("send_mode", "stdin") not in {"stdin"}:
+        if payload.get("send_mode", "stdin") not in {"stdin", "cmux"}:
             raise ValueError("Unsupported send_mode")
 
 
@@ -713,6 +718,61 @@ def readlink_cwd(pid: int) -> str | None:
         return None
 
 
+def get_process_env(pid: int) -> dict[str, str]:
+    try:
+        if _IS_MACOS:
+            return dict(_psutil.Process(pid).environ())
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        env: dict[str, str] = {}
+        for item in raw.split(b"\x00"):
+            if b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            env[key.decode(errors="ignore")] = value.decode(errors="ignore")
+        return env
+    except Exception:
+        return {}
+
+
+def get_cmux_context(pid: int) -> dict[str, str] | None:
+    env = get_process_env(pid)
+    workspace_id = env.get("CMUX_WORKSPACE_ID")
+    surface_id = env.get("CMUX_SURFACE_ID")
+    if not workspace_id or not surface_id:
+        return None
+    return {"workspace_id": workspace_id, "surface_id": surface_id}
+
+
+def list_cmux_workspace_names() -> dict[str, str]:
+    try:
+        proc = subprocess.run(
+            ["cmux", "list-workspaces", "--id-format", "both"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    names: dict[str, str] = {}
+    uuid_re = re.compile(r"\b[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\b", re.IGNORECASE)
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = uuid_re.search(line)
+        if not match:
+            continue
+        workspace_id = match.group(0)
+        title = line[match.end():].strip()
+        title = re.sub(r"\s+\[selected\]$", "", title).strip()
+        if title:
+            names[workspace_id] = title
+    return names
+
+
 def infer_agent_type(args: str) -> str:
     try:
         tokens = shlex.split(args)
@@ -720,10 +780,24 @@ def infer_agent_type(args: str) -> str:
         tokens = str(args).split()
     if not tokens:
         return ""
+    arg_text = str(args).lower()
+    if any(
+        marker in arg_text
+        for marker in (
+            "codex computer use",
+            "skycomputeruseclient",
+            "node_repl",
+        )
+    ):
+        return ""
     lowered = [token.lower() for token in tokens]
     basenames = [Path(token).name.lower() for token in tokens]
 
-    if "codex" in basenames:
+    codex_indexes = [
+        i for i, name in enumerate(basenames)
+        if name == "codex" and (i == 0 or lowered[i - 1] not in {"--source", "--agent"})
+    ]
+    if codex_indexes:
         if "app-server" in lowered:
             return ""
         return "codex"
@@ -740,6 +814,23 @@ def infer_agent_type(args: str) -> str:
         return "droid"
 
     return ""
+
+
+def extract_codex_session_id(args: str) -> str | None:
+    try:
+        tokens = shlex.split(args)
+    except Exception:
+        tokens = str(args).split()
+    if "resume" not in tokens:
+        return None
+    uuid_re = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        re.IGNORECASE,
+    )
+    for token in tokens[tokens.index("resume") + 1:]:
+        if uuid_re.match(token):
+            return token
+    return None
 
 
 def get_recent_files(root: str | None, pattern: str = "*.jsonl", limit: int = 120, include_subdirs: bool = True) -> list[Path]:
@@ -795,8 +886,12 @@ def parse_codex_session(path: Path) -> dict[str, Any] | None:
         "pending_items": [],
         "last_user_message": "",
         "source_file": str(path),
+        "session_kind": "main",
+        "model": None,
+        "needs_user": False,
+        "has_result": False,
     }
-    tail: deque[str] = deque(maxlen=80)
+    tail: deque[str] = deque(maxlen=300)
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             first = f.readline()
@@ -808,8 +903,19 @@ def parse_codex_session(path: Path) -> dict[str, Any] | None:
                     meta["cwd"] = payload.get("cwd")
                     meta["start_ts"] = parse_iso_ts(payload.get("timestamp")) or parse_iso_ts(obj.get("timestamp"))
                     meta["heartbeat_ts"] = parse_iso_ts(obj.get("timestamp")) or meta["heartbeat_ts"]
+                    if payload.get("thread_source") == "subagent" or isinstance(payload.get("source"), dict):
+                        if isinstance(payload.get("source"), dict) and payload["source"].get("subagent"):
+                            meta["session_kind"] = "subagent"
                 tail.append(first)
             for line in f:
+                obj = safe_json_loads(line)
+                if isinstance(obj, dict) and obj.get("type") == "turn_context":
+                    payload = obj.get("payload", {})
+                    model = payload.get("model")
+                    if model:
+                        meta["model"] = model
+                    if model == "codex-auto-review":
+                        meta["session_kind"] = "approval_review"
                 tail.append(line)
     except Exception:
         return None
@@ -819,6 +925,9 @@ def parse_codex_session(path: Path) -> dict[str, Any] | None:
     recent_tool = ""
     last_user = ""
     last_ts = meta["heartbeat_ts"]
+    last_user_ts = None
+    last_agent_ts = None
+    last_agent_phase = ""
     for line in reversed(tail):
         obj = safe_json_loads(line)
         if not isinstance(obj, dict):
@@ -830,23 +939,57 @@ def parse_codex_session(path: Path) -> dict[str, Any] | None:
             ep = obj.get("payload", {})
             if ep.get("type") == "agent_message" and not recent_text:
                 recent_text = ep.get("message", "")
+                last_agent_ts = ts or last_agent_ts
+                last_agent_phase = ep.get("phase", "") or last_agent_phase
         elif obj.get("type") == "response_item":
             candidate = extract_codex_message(obj.get("payload", {})) or ""
-            if candidate and candidate.startswith("tool:") and not recent_tool:
-                recent_tool = candidate
+            if candidate and candidate.startswith("tool:"):
+                if not recent_tool:
+                    recent_tool = candidate
+                continue
             elif candidate and not recent_text:
                 recent_text = candidate
+                last_agent_ts = ts or last_agent_ts
+                last_agent_phase = obj.get("payload", {}).get("phase", "") or last_agent_phase
         if not last_user and obj.get("type") == "event_msg":
             ep = obj.get("payload", {})
             if ep.get("type") == "user_message":
                 last_user = ep.get("message", "")
+                last_user_ts = ts or last_user_ts
         if not pending and obj.get("type") == "response_item":
             pending = extract_codex_pending(obj.get("payload", {}))
 
-    meta["recent_output"] = truncate(recent_text or recent_tool)
-    meta["pending_items"] = pending or ([truncate(last_user, 180)] if last_user else [])
+    needs_user = False
+    for pattern in DEFAULT_CONFIG["status"]["needs_input_patterns"]:
+        try:
+            if recent_text and re.search(pattern, recent_text, re.IGNORECASE):
+                needs_user = True
+                break
+        except re.error:
+            continue
+    has_result = bool(
+        recent_text
+        and last_agent_ts
+        and (last_user_ts is None or last_agent_ts >= last_user_ts)
+        and last_agent_phase == "final_answer"
+    )
+
+    if recent_text:
+        recent_output = recent_text
+    elif recent_tool and last_user:
+        recent_output = f"{truncate(last_user, 180)}\n\n当前动作: {recent_tool}"
+    else:
+        recent_output = recent_tool
+    meta["recent_output"] = truncate(recent_output)
+    if not pending and needs_user:
+        pending = ["需要你回话"]
+    elif not pending and has_result:
+        pending = ["有新结果待查看"]
+    meta["pending_items"] = pending
     meta["last_user_message"] = truncate(last_user, 180)
     meta["heartbeat_ts"] = last_ts
+    meta["needs_user"] = needs_user
+    meta["has_result"] = has_result
     return meta
 
 
@@ -1089,6 +1232,7 @@ class ProcInfo:
     cwd: str | None
     agent_type: str
     start_ts: float
+    session_id: str | None = None
 
 
 def _parse_etime(s: str) -> int:
@@ -1144,6 +1288,7 @@ def list_processes() -> list[ProcInfo]:
                 cwd=readlink_cwd(int(pid)),
                 agent_type=agent_type,
                 start_ts=now - et,
+                session_id=extract_codex_session_id(args) if agent_type == "codex" else None,
             )
         )
     return entries
@@ -1162,6 +1307,7 @@ def dedupe_processes(entries: list[ProcInfo]) -> list[ProcInfo]:
 
 
 def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    by_id = {s.get("session_id"): s for s in sessions if s.get("session_id")}
     by_cwd: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for session in sessions:
         cwd = session.get("cwd")
@@ -1173,10 +1319,18 @@ def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) ->
     used: set[str] = set()
     out: dict[int, dict[str, Any]] = {}
     for proc in processes:
+        if proc.session_id and proc.session_id in by_id:
+            session = by_id[proc.session_id]
+            out[proc.pid] = session
+            used.add(proc.session_id)
+            continue
         cwd = proc.cwd
         if not cwd:
             continue
-        candidates = [s for s in by_cwd.get(cwd, []) if s.get("session_id") not in used]
+        candidates = [
+            s for s in by_cwd.get(cwd, [])
+            if s.get("session_id") not in used and s.get("session_kind") != "approval_review"
+        ]
         if not candidates:
             continue
         best = min(
@@ -1320,6 +1474,9 @@ def infer_status(proc: ProcInfo, session: dict[str, Any] | None, config: dict[st
     heartbeat_age = (now - heartbeat_ts) if heartbeat_ts else None
     recent_output = (session or {}).get("recent_output", "") or ""
 
+    if (session or {}).get("needs_user") or (session or {}).get("has_result"):
+        return "needs-input"
+
     for pattern in cfg.get("needs_input_patterns", []):
         try:
             if re.search(pattern, recent_output, re.IGNORECASE):
@@ -1375,6 +1532,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
     aliases = read_json_file(config.get("aliases_file", BASE_DIR / "session_aliases.json"), {})
     send_template = host_cfg.get("send_command_template") or config.get("send_command_template")
     send_mode = host_cfg.get("send_mode") or config.get("send_mode")
+    cmux_workspace_names = list_cmux_workspace_names() if host_cfg.get("mode") == "local" else {}
     agents = []
     branch_cache: dict[str, str | None] = {}
     host_id = host_identity(host_cfg)
@@ -1400,6 +1558,15 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
         parent_app = None
         if host_cfg.get("mode") == "local" and _IS_MACOS:
             parent_app = detect_parent_application(proc.pid)
+        cmux_context = get_cmux_context(proc.pid) if host_cfg.get("mode") == "local" else None
+        cmux_workspace_id = (cmux_context or {}).get("workspace_id")
+        cmux_surface_id = (cmux_context or {}).get("surface_id")
+        cmux_workspace_name = cmux_workspace_names.get(cmux_workspace_id or "")
+        interactive_supported = bool(
+            send_template
+            or send_mode == "stdin"
+            or (send_mode == "cmux" and cmux_workspace_id and cmux_surface_id)
+        )
         
         agents.append(
             {
@@ -1420,6 +1587,9 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "heartbeat_age_sec": (utc_now_ts() - heartbeat_ts) if heartbeat_ts else None,
                 "parent_app": parent_app["app_name"] if parent_app else None,
                 "parent_app_icon": parent_app["app_icon"] if parent_app else None,
+                "cmux_workspace_id": cmux_workspace_id,
+                "cmux_surface_id": cmux_surface_id,
+                "cmux_workspace_name": cmux_workspace_name,
                 "uptime_sec": proc.etimes,
                 "cpu": proc.cpu,
                 "mem": proc.mem,
@@ -1428,9 +1598,12 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "recent_output": (session or {}).get("recent_output", ""),
                 "pending_items": (session or {}).get("pending_items", []),
                 "session_id": (session or {}).get("session_id"),
+                "session_kind": (session or {}).get("session_kind"),
+                "needs_user": bool((session or {}).get("needs_user")),
+                "has_result": bool((session or {}).get("has_result")),
                 "session_file": (session or {}).get("source_file"),
                 "last_user_message": (session or {}).get("last_user_message"),
-                "interactive_supported": bool(send_template or send_mode == "stdin"),
+                "interactive_supported": interactive_supported,
                 "updated_at": iso_now(),
             }
         )
@@ -1734,6 +1907,52 @@ def _send_via_tmux(pane_id: str, message: str) -> dict:
         "stderr": truncate(r.stderr, 500),
     }
 
+
+def send_via_cmux_local(agent: dict[str, Any], message: str) -> dict[str, Any]:
+    workspace_id = agent.get("cmux_workspace_id")
+    surface_id = agent.get("cmux_surface_id")
+    if not workspace_id or not surface_id:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "cmux mode requires CMUX_WORKSPACE_ID and CMUX_SURFACE_ID in the agent process environment",
+        }
+
+    send_cmd = [
+        "cmux",
+        "send",
+        "--workspace",
+        str(workspace_id),
+        "--surface",
+        str(surface_id),
+        message,
+    ]
+    enter_cmd = [
+        "cmux",
+        "send-key",
+        "--workspace",
+        str(workspace_id),
+        "--surface",
+        str(surface_id),
+        "Enter",
+    ]
+
+    first = subprocess.run(send_cmd, capture_output=True, text=True, timeout=10)
+    if first.returncode != 0:
+        return {
+            "returncode": first.returncode,
+            "stdout": truncate(first.stdout, 500),
+            "stderr": truncate(first.stderr, 500),
+        }
+
+    second = subprocess.run(enter_cmd, capture_output=True, text=True, timeout=10)
+    return {
+        "returncode": second.returncode,
+        "stdout": truncate((first.stdout or "") + (second.stdout or ""), 500),
+        "stderr": truncate((first.stderr or "") + (second.stderr or ""), 500),
+    }
+
+
 def send_via_stdin_local(agent: dict[str, Any], message: str) -> dict[str, Any]:
     pid = int(agent["pid"])
     payload = (message + "\r").encode()
@@ -1871,6 +2090,7 @@ class SnapshotStore:
                 "refreshing": self.refreshing,
                 "last_error": self.last_error,
                 "refresh_interval_sec": self.config.get("refresh_interval_sec", 10),
+                "dashboard": self.config.get("dashboard", {}),
             }
 
     def all_agents(self) -> list[dict[str, Any]]:
@@ -1921,6 +2141,10 @@ def send_agent_action(store: SnapshotStore, agent_id: str, message: str) -> dict
             result = send_via_stdin_remote_password(host_cfg, creds, agent, message)
         else:
             result = send_via_stdin_remote(host_cfg, agent, message)
+    elif send_mode == "cmux":
+        if host_cfg.get("mode", "local") != "local":
+            raise ValueError("send_mode=cmux is only supported for local hosts")
+        result = send_via_cmux_local(agent, message)
     elif template:
         if host_cfg.get("mode", "local") == "local":
             result = run_local_shell(template, agent, message)

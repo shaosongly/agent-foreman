@@ -85,6 +85,7 @@
               <span>催办方式</span>
               <select id="hostSendModeInput">
                 <option value="stdin">stdin</option>
+                <option value="cmux">cmux</option>
               </select>
             </label>
           </div>
@@ -129,7 +130,10 @@
 
   <section class="filters">
     <input id="searchInput" type="search" placeholder="按工地 / 项目 / 输出 / 待办搜牛马">
-    <div id="hostFilters" class="host-filters"></div>
+    <div class="filter-groups">
+      <div id="toolFilters" class="tool-filters"></div>
+      <div id="hostFilters" class="host-filters"></div>
+    </div>
   </section>
 
   <section id="hostErrors"></section>
@@ -162,23 +166,26 @@
           <div class="action-feedback"></div>
         </div>
       </div>
-      <div class="pending-block">
-        <div class="label">还没干完</div>
-        <ul class="pending-list"></ul>
-      </div>
       <div class="recent-block">
         <div class="label">最近动静</div>
-        <pre class="recent-output"></pre>
+        <div class="recent-output"></div>
       </div>
-      <details class="details">
-        <summary>监工细节</summary>
-        <div class="kv cwd"></div>
-        <div class="kv cmd"></div>
-        <div class="kv session"></div>
-      </details>
-      <div class="action-row">
-        <textarea class="quick-input" rows="3" placeholder="留空直接催，填内容就训话…"></textarea>
-        <button class="mini-btn send-btn" type="button">发话</button>
+      <div class="card-actions">
+        <div class="pending-block">
+          <div class="label">还没干完</div>
+          <ul class="pending-list"></ul>
+        </div>
+        <div class="action-row">
+          <textarea class="quick-input" rows="2" placeholder="留空直接催，填内容就训话…"></textarea>
+          <button class="mini-btn send-btn" type="button">发话</button>
+        </div>
+        <div class="quick-actions"></div>
+        <details class="details">
+          <summary>监工细节</summary>
+          <div class="kv cwd"></div>
+          <div class="kv cmd"></div>
+          <div class="kv session"></div>
+        </details>
       </div>
     </article>
   </template>

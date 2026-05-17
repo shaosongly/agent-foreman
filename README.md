@@ -4,6 +4,35 @@
 
 ---
 
+## Local CMUX + Codex Fork
+
+This fork includes a local-first dashboard mode for monitoring Codex sessions that are launched inside CMUX workspaces.
+
+If your goal is to run the Mac local CMUX/Codex dashboard, start here:
+
+- Setup and usage guide: [docs/local-cmux-codex-dashboard.md](docs/local-cmux-codex-dashboard.md)
+- Local CMUX example config: [config.local-cmux.example.json](config.local-cmux.example.json)
+- One-command local launcher: [run-local-cmux.sh](run-local-cmux.sh)
+
+Quick start:
+
+```bash
+git clone git@github.com:shaosongly/agent-foreman.git
+cd agent-foreman
+git checkout local-cmux-dashboard
+./run-local-cmux.sh
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787
+```
+
+This mode uses `send_mode: "cmux"` and does not require tmux. It expects Codex sessions to be started from CMUX so the agent process has `CMUX_WORKSPACE_ID` and `CMUX_SURFACE_ID` in its environment.
+
+---
+
 <a name="english"></a>
 
 ## English

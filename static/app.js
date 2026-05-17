@@ -1,16 +1,30 @@
 const state = {
   hosts: new Set(),
+  toolTypes: null,
+  toolStatusFilters: {},
   search: "",
   snapshot: null,
   managedHosts: [],
 };
 
 const toolOrder = ["codex", "claude", "droid"];
-const laneGroups = [
-  { key: "working", label: "开工", statuses: ["busy", "active"] },
-  { key: "slacking", label: "摸鱼", statuses: ["idle", "stale"] },
-  { key: "needs-input", label: "等回话", statuses: ["needs-input"] },
-];
+const toolLabels = {
+  codex: "Codex",
+  claude: "Claude",
+  droid: "Droid",
+};
+const statusOrder = {
+  "needs-input": 0,
+  busy: 1,
+  active: 2,
+  idle: 3,
+  stale: 4,
+};
+const statusFilterMap = {
+  "needs-input": ["needs-input"],
+  busy: ["busy", "active"],
+  idle: ["idle", "stale"],
+};
 
 function $(id) {
   return document.getElementById(id);
@@ -31,6 +45,98 @@ function fmtTs(ts) {
   } catch {
     return ts;
   }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderInlineMarkdown(text) {
+  let out = escapeHtml(text);
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  return out;
+}
+
+function renderMarkdown(text) {
+  const source = String(text || "").trim();
+  if (!source) return "<p>暂时没抓到动静</p>";
+
+  const lines = source.split(/\r?\n/);
+  const html = [];
+  let paragraph = [];
+  let listItems = [];
+  let inFence = false;
+  let fenceLines = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!listItems.length) return;
+    html.push(`<ul>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+    listItems = [];
+  };
+  const flushFence = () => {
+    html.push(`<pre><code>${escapeHtml(fenceLines.join("\n"))}</code></pre>`);
+    fenceLines = [];
+  };
+
+  lines.forEach((line) => {
+    if (/^\s*```/.test(line)) {
+      if (inFence) {
+        flushFence();
+        inFence = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inFence = true;
+      }
+      return;
+    }
+    if (inFence) {
+      fenceLines.push(line);
+      return;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(heading[1].length + 2, 5);
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2].trim())}</h${level}>`);
+      return;
+    }
+
+    const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+    if (bullet) {
+      flushParagraph();
+      listItems.push(bullet[1].trim());
+      return;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      return;
+    }
+
+    flushList();
+    paragraph.push(line.trim());
+  });
+
+  if (inFence) flushFence();
+  flushParagraph();
+  flushList();
+  return html.join("");
 }
 
 async function postJson(url, payload) {
@@ -121,6 +227,16 @@ function avatarMarkup(status, agentType) {
 
 let _activeFilter = null;
 
+function toggleStatusFilter(slug) {
+  _activeFilter = _activeFilter === slug ? null : slug;
+  if (state.snapshot) render(state.snapshot);
+}
+
+function toggleToolStatusFilter(tool, slug) {
+  state.toolStatusFilters[tool] = state.toolStatusFilters[tool] === slug ? null : slug;
+  if (state.snapshot) render(state.snapshot);
+}
+
 function summaryCard(label, value, slug, filterStatuses) {
   const div = document.createElement("div");
   const isActive = _activeFilter === slug;
@@ -128,10 +244,7 @@ function summaryCard(label, value, slug, filterStatuses) {
   div.innerHTML = `<div class="k">${label}</div><div class="v">${value}</div>`;
   if (filterStatuses) {
     div.title = "点击筛选";
-    div.onclick = () => {
-      _activeFilter = _activeFilter === slug ? null : slug;
-      if (state.snapshot) render(state.snapshot);
-    };
+    div.onclick = () => toggleStatusFilter(slug);
   }
   return div;
 }
@@ -149,6 +262,16 @@ function _saveHostFilter() {
   try { localStorage.setItem("af_hosts", JSON.stringify([...state.hosts])); } catch {}
 }
 
+function _saveToolFilter() {
+  try { localStorage.setItem("af_tool_types", JSON.stringify([...state.toolTypes])); } catch {}
+}
+
+function configuredToolTypes(snapshot) {
+  const configured = snapshot.dashboard?.agent_types;
+  const list = Array.isArray(configured) && configured.length ? configured : toolOrder;
+  return list.filter((tool, index, arr) => toolOrder.includes(tool) && arr.indexOf(tool) === index);
+}
+
 function _loadHostFilter(hostNames) {
   try {
     const saved = JSON.parse(localStorage.getItem("af_hosts") || "null");
@@ -160,6 +283,39 @@ function _loadHostFilter(hostNames) {
   } catch {}
   // default: all hosts selected
   hostNames.forEach((h) => state.hosts.add(h));
+}
+
+function _loadToolFilter(toolNames) {
+  try {
+    const saved = JSON.parse(localStorage.getItem("af_tool_types") || "null");
+    if (saved && Array.isArray(saved)) {
+      const valid = saved.filter((tool) => toolNames.includes(tool));
+      if (valid.length) { state.toolTypes = new Set(valid); return; }
+    }
+  } catch {}
+  state.toolTypes = new Set(toolNames);
+}
+
+function renderToolFilters(snapshot) {
+  const toolNames = configuredToolTypes(snapshot);
+  if (!state.toolTypes) _loadToolFilter(toolNames);
+  const wrap = $("toolFilters");
+  wrap.innerHTML = "";
+  toolNames.forEach((tool) => {
+    const chip = document.createElement("button");
+    chip.className = `tool-chip ${state.toolTypes.has(tool) ? "active" : ""}`;
+    chip.textContent = toolLabels[tool] || tool;
+    chip.onclick = () => {
+      if (state.toolTypes.has(tool)) {
+        state.toolTypes.delete(tool);
+      } else {
+        state.toolTypes.add(tool);
+      }
+      _saveToolFilter();
+      render(state.snapshot);
+    };
+    wrap.appendChild(chip);
+  });
 }
 
 function renderHostFilters(snapshot) {
@@ -198,10 +354,10 @@ function renderErrors(snapshot) {
 }
 
 function agentMatches(agent) {
+  if (state.toolTypes && !state.toolTypes.has(agent.agent_type)) return false;
   if (state.hosts.size && !state.hosts.has(agent.host)) return false;
   if (_activeFilter && _activeFilter !== "agents") {
-    const filterMap = { "needs-input": ["needs-input"], "busy": ["busy","active"], "idle": ["idle","stale"] };
-    const allowed = filterMap[_activeFilter];
+    const allowed = statusFilterMap[_activeFilter];
     if (allowed && !allowed.includes(agent.status)) return false;
   }
   const q = state.search.trim().toLowerCase();
@@ -244,12 +400,15 @@ function makeCard(agent) {
   }
   node.querySelector(".agent-avatar").innerHTML = avatarMarkup(agent.status, agent.agent_type);
   node.querySelector(".agent-caption").textContent = avatarCaption(agent.status);
-  node.querySelector(".project").textContent = agent.display_name || agent.project || "(unknown project)";
-  node.querySelector(".branch").textContent = agent.branch ? `分支 · ${agent.branch}` : "分支 · 暂无";
+  const title = agent.display_name || agent.cmux_workspace_name || agent.project || "(unknown project)";
+  node.querySelector(".project").textContent = title;
+  const phaseLabel = agent.session_kind === "approval_review" ? "Review / 审批" : "主会话";
+  const branchText = agent.branch ? `分支 · ${agent.branch}` : "分支 · 暂无";
+  node.querySelector(".branch").textContent = `${branchText} · ${phaseLabel}`;
   node.querySelector(".hostline").textContent = `${agent.host} · pid ${agent.pid} · ${agent.stat}`;
   node.querySelector(".metrics").textContent =
     `cpu ${agent.cpu?.toFixed?.(1) ?? agent.cpu}% · mem ${agent.mem?.toFixed?.(1) ?? agent.mem}% · 在跑 ${fmtAge(agent.uptime_sec)} · 心跳 ${fmtAge(agent.heartbeat_age_sec)} 前`;
-  node.querySelector(".recent-output").textContent = agent.recent_output || agent.last_user_message || "暂时没抓到动静";
+  node.querySelector(".recent-output").innerHTML = renderMarkdown(agent.recent_output || agent.last_user_message || "暂时没抓到动静");
   const list = node.querySelector(".pending-list");
   const items = agent.pending_items?.length ? agent.pending_items : ["（暂时没翻到明确待办）"];
   items.slice(0, 6).forEach((item) => {
@@ -283,15 +442,19 @@ function makeCard(agent) {
 
   const sendBtn = node.querySelector(".send-btn");
   const input = node.querySelector(".quick-input");
+  const quickActions = node.querySelector(".quick-actions");
+  const quickMessages = ["继续", "收到", "请总结当前状态"];
   if (!agent.interactive_supported) {
     sendBtn.disabled = true;
     input.disabled = true;
     input.placeholder = "这工位现在没法发话";
+    quickActions.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   } else {
-    const doSend = async () => {
+    const doSend = async (explicitMessage = null) => {
       if (sendBtn.disabled) return;
-      const message = input.value.trim() || "继续";
-      const isContinue = !input.value.trim();
+      const hasExplicitMessage = explicitMessage !== null;
+      const message = (explicitMessage ?? input.value.trim()) || "继续";
+      const isContinue = message === "继续" && (hasExplicitMessage || !input.value.trim());
       sendBtn.disabled = true;
       const origText = sendBtn.textContent;
       sendBtn.textContent = "发话中…";
@@ -299,7 +462,7 @@ function makeCard(agent) {
         const res = await postJson("/api/action", { agent_id: agent.id, message });
         const ok = res.result?.returncode === 0;
         setFeedback(ok ? (isContinue ? "已催它继续干活" : `已发话: ${message}`) : (res.result?.stderr || "发不出去"), ok ? "ok" : "err");
-        if (ok && !isContinue) input.value = "";
+        if (ok && !hasExplicitMessage && !isContinue) input.value = "";
       } catch (err) {
         setFeedback(String(err.message || err), "err");
       } finally {
@@ -307,7 +470,15 @@ function makeCard(agent) {
         sendBtn.textContent = origText;
       }
     };
-    sendBtn.onclick = doSend;
+    sendBtn.onclick = () => doSend();
+    quickMessages.forEach((message) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "quick-action";
+      button.textContent = message;
+      button.onclick = () => doSend(message);
+      quickActions.appendChild(button);
+    });
     input.addEventListener("keydown", (e) => {
       // Enter = send; Ctrl+Enter or Shift+Enter = newline
       if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
@@ -389,26 +560,42 @@ function buildToolSection(tool, agents) {
         </button>
       </div>
     </div>
+    <div class="status-strip"></div>
     <div class="tool-grid"></div>
   `;
-  const grid = section.querySelector(".tool-grid");
-  laneGroups.forEach((group) => {
-    const lane = document.createElement("div");
-    lane.className = "lane";
-    const groupedAgents = agents
-      .filter((agent) => group.statuses.includes(agent.status))
-      .sort((a, b) => (a.heartbeat_age_sec ?? 1e12) - (b.heartbeat_age_sec ?? 1e12));
-    lane.innerHTML = `
-      <div class="lane-head ${group.key}">
-        <span>${group.label}</span>
-        <span class="count">${groupedAgents.length}</span>
-      </div>
-      <div class="lane-body"></div>
-    `;
-    const body = lane.querySelector(".lane-body");
-    groupedAgents.forEach((agent) => body.appendChild(makeCard(agent)));
-    grid.appendChild(lane);
+  const strip = section.querySelector(".status-strip");
+  const activeToolFilter = state.toolStatusFilters[tool];
+  [
+    ["needs-input", "等回话"],
+    ["busy", "开工"],
+    ["idle", "摸鱼"],
+  ].forEach(([status, label]) => {
+    const count = agents.filter((agent) => {
+      if (status === "busy") return ["busy", "active"].includes(agent.status);
+      if (status === "idle") return ["idle", "stale"].includes(agent.status);
+      return agent.status === status;
+    }).length;
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `status-count ${status}${activeToolFilter === status ? " active" : ""}`;
+    chip.disabled = count === 0;
+    chip.title = count === 0 ? `${label}暂无 Agent` : (activeToolFilter === status ? "取消班组筛选" : `当前班组只看${label}`);
+    chip.textContent = `${label} ${count}`;
+    chip.onclick = () => toggleToolStatusFilter(tool, status);
+    strip.appendChild(chip);
   });
+  const grid = section.querySelector(".tool-grid");
+  const visibleAgents = activeToolFilter
+    ? agents.filter((agent) => (statusFilterMap[activeToolFilter] || []).includes(agent.status))
+    : agents;
+  visibleAgents
+    .slice()
+    .sort((a, b) => {
+      const statusDelta = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
+      if (statusDelta) return statusDelta;
+      return (a.heartbeat_age_sec ?? 1e12) - (b.heartbeat_age_sec ?? 1e12);
+    })
+    .forEach((agent) => grid.appendChild(makeCard(agent)));
   return section;
 }
 
@@ -431,6 +618,8 @@ function renderBoard(snapshot) {
   });
   board.innerHTML = "";
   const agents = snapshot.hosts.flatMap((h) => h.agents || []).filter(agentMatches);
+  const visibleTools = configuredToolTypes(snapshot);
+  const hideEmptyTools = snapshot.dashboard?.hide_empty_tools !== false;
   const byTool = {
     codex: agents.filter((a) => a.agent_type === "codex"),
     claude: agents.filter((a) => a.agent_type === "claude"),
@@ -438,9 +627,12 @@ function renderBoard(snapshot) {
   };
   
   // Sort tools by agent count (descending)
-  const sortedTools = toolOrder.slice().sort((a, b) => {
-    return (byTool[b] || []).length - (byTool[a] || []).length;
-  });
+  const sortedTools = visibleTools
+    .filter((tool) => !state.toolTypes || state.toolTypes.has(tool))
+    .filter((tool) => !hideEmptyTools || (byTool[tool] || []).length > 0)
+    .sort((a, b) => {
+      return (byTool[b] || []).length - (byTool[a] || []).length;
+    });
   
   sortedTools.forEach((tool) => {
     const section = buildToolSection(tool, byTool[tool] || []);
@@ -454,6 +646,12 @@ function renderBoard(snapshot) {
       section.querySelector(".collapse-icon").textContent = "▶";
     }
   });
+  if (!sortedTools.length) {
+    const empty = document.createElement("section");
+    empty.className = "empty-board";
+    empty.textContent = "当前筛选下没有可显示的 Agent。";
+    board.appendChild(empty);
+  }
   // restore saved inputs and focus
   board.querySelectorAll(".agent-card[data-agent-id]").forEach((card) => {
     const v = savedInputs[card.dataset.agentId];
@@ -646,6 +844,7 @@ function render(snapshot) {
   $("generatedAt").textContent = fmtTs(snapshot.generated_at);
   $("pollInterval").textContent = `1s（后台静默）`;
   renderSummary(snapshot);
+  renderToolFilters(snapshot);
   renderHostFilters(snapshot);
   renderErrors(snapshot);
   renderBoard(snapshot);
@@ -658,8 +857,29 @@ async function loadDashboard() {
 }
 
 async function triggerRefresh() {
-  await fetch("/api/refresh");
-  setTimeout(loadDashboard, 300);
+  const btn = $("refreshBtn");
+  if (btn.disabled) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "巡场中…";
+  btn.classList.remove("ok", "err");
+  try {
+    await fetch("/api/refresh");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await loadDashboard();
+    btn.textContent = "巡完了";
+    btn.classList.add("ok");
+  } catch (err) {
+    console.warn("refresh error", err);
+    btn.textContent = "巡场失败";
+    btn.classList.add("err");
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = original;
+      btn.classList.remove("ok", "err");
+    }, 1200);
+  }
 }
 
 $("searchInput").addEventListener("input", (e) => {

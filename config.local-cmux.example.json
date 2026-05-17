@@ -3,15 +3,16 @@
   "session_scan_limit": 120,
   "aliases_file": "session_aliases.json",
   "credentials_file": "credentials.enc.json",
-  "send_mode": "stdin",
+  "send_mode": "cmux",
   "dashboard": {
-    "agent_types": ["codex", "claude", "droid"],
+    "agent_types": ["codex"],
     "hide_empty_tools": true
   },
   "hosts": [
     {
       "name": "local",
-      "mode": "local"
+      "mode": "local",
+      "send_mode": "cmux"
     }
   ],
   "managed_hosts": [],
