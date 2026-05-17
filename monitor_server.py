@@ -786,7 +786,8 @@ def list_cmux_process_contexts() -> dict[int, dict[str, str]]:
     if proc.returncode != 0:
         return {}
 
-    contexts: dict[int, dict[str, str]] = defaultdict(dict)
+    direct_contexts: dict[int, dict[str, str]] = defaultdict(dict)
+    parent_pids: dict[int, int] = {}
     tag_re = re.compile(
         r"workspace:([0-9A-F-]+):tag:codex\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
         re.IGNORECASE,
@@ -803,12 +804,40 @@ def list_cmux_process_contexts() -> dict[int, dict[str, str]]:
         parent = parts[5]
         tag_match = tag_re.search(parent)
         if tag_match:
-            contexts[pid]["workspace_id"] = tag_match.group(1)
-            contexts[pid]["session_id"] = tag_match.group(2)
+            direct_contexts[pid]["workspace_id"] = tag_match.group(1)
+            direct_contexts[pid]["session_id"] = tag_match.group(2)
         surface_match = surface_re.match(parent)
         if surface_match:
-            contexts[pid]["surface_ref"] = parent
-    return dict(contexts)
+            direct_contexts[pid]["surface_ref"] = parent
+        else:
+            try:
+                parent_pids[pid] = int(parent)
+            except ValueError:
+                pass
+
+    resolved: dict[int, dict[str, str]] = {}
+
+    def resolve(pid: int, seen: set[int] | None = None) -> dict[str, str]:
+        if pid in resolved:
+            return resolved[pid]
+        if seen is None:
+            seen = set()
+        if pid in seen:
+            return dict(direct_contexts.get(pid, {}))
+        seen.add(pid)
+
+        context = dict(direct_contexts.get(pid, {}))
+        parent_pid = parent_pids.get(pid)
+        if parent_pid is not None:
+            parent_context = resolve(parent_pid, seen)
+            for key, value in parent_context.items():
+                context.setdefault(key, value)
+        resolved[pid] = context
+        return context
+
+    for pid in set(direct_contexts) | set(parent_pids):
+        resolve(pid)
+    return {pid: ctx for pid, ctx in resolved.items() if ctx}
 
 
 def infer_agent_type(args: str) -> str:
@@ -1271,8 +1300,13 @@ class ProcInfo:
     agent_type: str
     start_ts: float
     session_id: str | None = None
+    command_session_id: str | None = None
+    cmux_session_id: str | None = None
     cmux_workspace_id: str | None = None
     cmux_surface_ref: str | None = None
+    cmux_surface_id: str | None = None
+    match_source: str | None = None
+    override_alias: str | None = None
 
 
 def _parse_etime(s: str) -> int:
@@ -1320,6 +1354,7 @@ def list_processes() -> list[ProcInfo]:
         pid_int = int(pid)
         cmux_context = cmux_contexts.get(pid_int, {})
         command_session_id = extract_codex_session_id(args) if agent_type == "codex" else None
+        cmux_session_id = cmux_context.get("session_id")
         entries.append(
             ProcInfo(
                 pid=pid_int,
@@ -1332,9 +1367,12 @@ def list_processes() -> list[ProcInfo]:
                 cwd=readlink_cwd(pid_int),
                 agent_type=agent_type,
                 start_ts=now - et,
-                session_id=cmux_context.get("session_id") or command_session_id,
+                session_id=cmux_session_id or command_session_id,
+                command_session_id=command_session_id,
+                cmux_session_id=cmux_session_id,
                 cmux_workspace_id=cmux_context.get("workspace_id"),
                 cmux_surface_ref=cmux_context.get("surface_ref"),
+                match_source="cmux_tag" if cmux_session_id else ("command_resume" if command_session_id else None),
             )
         )
     return entries
@@ -1350,6 +1388,53 @@ def dedupe_processes(entries: list[ProcInfo]) -> list[ProcInfo]:
         roots.append(p)
     roots.sort(key=lambda p: p.start_ts)
     return roots
+
+
+def _normalize_session_override(value: Any) -> dict[str, str]:
+    if isinstance(value, str):
+        return {"session_id": value}
+    if isinstance(value, dict):
+        session_id = value.get("session_id") or value.get("id")
+        if session_id:
+            out = {"session_id": str(session_id)}
+            if value.get("alias"):
+                out["alias"] = str(value["alias"])
+            return out
+    return {}
+
+
+def apply_session_overrides(
+    processes: list[ProcInfo],
+    config: dict[str, Any],
+    workspace_names: dict[str, str] | None = None,
+) -> dict[int, dict[str, str]]:
+    overrides = config.get("session_overrides") or {}
+    if not isinstance(overrides, dict):
+        return {}
+    workspace_names = workspace_names or {}
+    applied: dict[int, dict[str, str]] = {}
+
+    for proc in processes:
+        workspace_name = workspace_names.get(proc.cmux_workspace_id or "")
+        keys = [
+            f"pid:{proc.pid}",
+            f"cmux_surface:{proc.cmux_surface_id}",
+            f"cmux_surface:{proc.cmux_surface_ref}",
+            f"cmux_workspace:{proc.cmux_workspace_id}",
+            f"cmux_workspace_name:{workspace_name}",
+        ]
+        for key in keys:
+            if key.endswith(":None") or key.endswith(":"):
+                continue
+            override = _normalize_session_override(overrides.get(key))
+            if not override:
+                continue
+            proc.session_id = override["session_id"]
+            proc.match_source = "manual_override"
+            proc.override_alias = override.get("alias")
+            applied[proc.pid] = override
+            break
+    return applied
 
 
 def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -1386,6 +1471,8 @@ def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) ->
             key=lambda s: abs((s.get("start_ts") or s.get("heartbeat_ts") or proc.start_ts) - proc.start_ts),
         )
         out[proc.pid] = best
+        if not proc.match_source:
+            proc.match_source = "cwd_time"
         if best.get("session_id"):
             used.add(best["session_id"])
     return out
@@ -1546,6 +1633,14 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
     host_paths = {**base_paths, **host_cfg.get("paths", {})}
 
     procs = dedupe_processes(list_processes())
+    cmux_workspace_names = list_cmux_workspace_names() if host_cfg.get("mode") == "local" else {}
+    if host_cfg.get("mode") == "local" and _IS_MACOS:
+        for proc in procs:
+            cmux_context = get_cmux_context(proc.pid) or {}
+            proc.cmux_workspace_id = proc.cmux_workspace_id or cmux_context.get("workspace_id")
+            proc.cmux_surface_id = proc.cmux_surface_id or cmux_context.get("surface_id")
+    apply_session_overrides(procs, config, cmux_workspace_names)
+
     codex_procs = [p for p in procs if p.agent_type == "codex"]
     claude_procs = [p for p in procs if p.agent_type == "claude"]
     droid_procs = [p for p in procs if p.agent_type == "droid"]
@@ -1580,7 +1675,6 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
     aliases = read_json_file(config.get("aliases_file", BASE_DIR / "session_aliases.json"), {})
     send_template = host_cfg.get("send_command_template") or config.get("send_command_template")
     send_mode = host_cfg.get("send_mode") or config.get("send_mode")
-    cmux_workspace_names = list_cmux_workspace_names() if host_cfg.get("mode") == "local" else {}
     agents = []
     branch_cache: dict[str, str | None] = {}
     host_id = host_identity(host_cfg)
@@ -1607,8 +1701,8 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
         if host_cfg.get("mode") == "local" and _IS_MACOS:
             parent_app = detect_parent_application(proc.pid)
         cmux_context = get_cmux_context(proc.pid) if host_cfg.get("mode") == "local" else None
-        cmux_workspace_id = (cmux_context or {}).get("workspace_id")
-        cmux_surface_id = (cmux_context or {}).get("surface_id")
+        cmux_workspace_id = (cmux_context or {}).get("workspace_id") or proc.cmux_workspace_id
+        cmux_surface_id = (cmux_context or {}).get("surface_id") or proc.cmux_surface_id
         cmux_workspace_name = cmux_workspace_names.get(cmux_workspace_id or "")
         interactive_supported = bool(
             send_template
@@ -1627,7 +1721,7 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "pid": proc.pid,
                 "ppid": proc.ppid,
                 "project": os.path.basename(cwd) if cwd else None,
-                "display_name": aliases.get(f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or (cwd or proc.pid)}"),
+                "display_name": proc.override_alias or aliases.get(f"{host_id}:{proc.agent_type}:{(session or {}).get('session_id') or (cwd or proc.pid)}"),
                 "cwd": cwd,
                 "branch": branch,
                 "status": status,
@@ -1637,7 +1731,9 @@ def summarize_host(config: dict[str, Any], host_cfg: dict[str, Any]) -> dict[str
                 "parent_app_icon": parent_app["app_icon"] if parent_app else None,
                 "cmux_workspace_id": cmux_workspace_id,
                 "cmux_surface_id": cmux_surface_id,
+                "cmux_surface_ref": proc.cmux_surface_ref,
                 "cmux_workspace_name": cmux_workspace_name,
+                "match_source": proc.match_source or "none",
                 "uptime_sec": proc.etimes,
                 "cpu": proc.cpu,
                 "mem": proc.mem,

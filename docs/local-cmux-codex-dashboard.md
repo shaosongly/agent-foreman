@@ -34,9 +34,24 @@ cmux send-key --workspace <workspace_id> --surface <surface_id> Enter
 
 ### Codex 主会话识别
 
-Codex 进程会优先从 CMUX 的进程视图里读取 `workspace:<id>:tag:codex.<session_id>`，把 session id 绑定到真实的 CMUX surface 进程 PID。拿不到 CMUX tag 时，再从命令行里的 `codex resume <session_id>` 提取 session id，最后才考虑非 CMUX 场景下的 cwd/start time 兜底匹配。
+Codex 进程会优先从 CMUX 的进程视图里读取 `workspace:<id>:tag:codex.<session_id>`，把 session id 绑定到真实的 CMUX surface 进程 PID。实现上会合并 `cmux top` 里同一 PID 的 tag / surface 行，并沿父进程链继承上下文，所以 `surface -> login -> shell -> codex` 这种结构也能拿到所属 workspace、surface 和 session。
+
+自动匹配优先级是：
+
+1. `session_overrides` 手动覆盖。
+2. CMUX tag：`workspace:<id>:tag:codex.<session_id>`。
+3. 命令行：`codex resume <session_id>`。
+4. 非 CMUX 场景下的 cwd/start time 兜底匹配。
 
 对本机 CMUX Codex 来说，如果没有可靠的 session id，就不会仅凭 cwd/start time 猜测 session。这样多个 Codex 都在同一个目录下运行时，宁可只显示进程状态，也避免把某个 surface 的会话内容贴到另一个 Agent 卡片上。
+
+卡片的“监工细节”会显示匹配来源：
+
+- `手动覆盖`
+- `CMUX tag`
+- `resume 命令`
+- `目录/时间`
+- `未匹配`
 
 ### 辅助进程过滤
 
@@ -114,6 +129,7 @@ http://127.0.0.1:8787
 ```json
 {
   "send_mode": "cmux",
+  "session_overrides": {},
   "dashboard": {
     "agent_types": ["codex"],
     "hide_empty_tools": true
@@ -145,6 +161,28 @@ http://127.0.0.1:8787
 页面顶部也会提供工具类型 chip，用来临时开关当前浏览器里的展示状态；这个临时选择会保存在浏览器 `localStorage` 里。
 
 `config.json` 被 `.gitignore` 忽略，可以按本机情况修改。
+
+### 手动覆盖匹配
+
+如果自动识别仍然把某个 CMUX 工位匹配错了，可以在本机 `config.json` 里加 `session_overrides`。它只影响明确写入的条目，不会关闭其他 Agent 的自动匹配。
+
+```json
+{
+  "session_overrides": {
+    "cmux_workspace_name:知识库构建": {
+      "session_id": "019e3015-671b-7ec2-a133-1cf4a7b77c99",
+      "alias": "知识库构建"
+    },
+    "cmux_workspace:F3A4C221-2C13-4166-AAB1-A242861C4F99": {
+      "session_id": "019e30e1-4343-7c11-a58e-c95df56f4fe2"
+    },
+    "cmux_surface:surface:2": "019e30e1-4343-7c11-a58e-c95df56f4fe2",
+    "pid:28760": "019e30e1-4343-7c11-a58e-c95df56f4fe2"
+  }
+}
+```
+
+建议优先用 `cmux_workspace_name:<名称>` 或 `cmux_workspace:<UUID>`。`cmux_surface:surface:<编号>` 和 `pid:<pid>` 更适合临时排查，因为 CMUX surface 编号和进程 PID 可能会随重启变化。
 
 ## 日常使用
 

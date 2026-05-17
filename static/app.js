@@ -25,6 +25,13 @@ const statusFilterMap = {
   busy: ["busy", "active"],
   idle: ["idle", "stale"],
 };
+const matchSourceLabels = {
+  manual_override: "手动覆盖",
+  cmux_tag: "CMUX tag",
+  command_resume: "resume 命令",
+  cwd_time: "目录/时间",
+  none: "未匹配",
+};
 
 function $(id) {
   return document.getElementById(id);
@@ -418,7 +425,13 @@ function makeCard(agent) {
   });
   node.querySelector(".cwd").textContent = `工地目录: ${agent.cwd || "n/a"}`;
   node.querySelector(".cmd").textContent = `跑的命令: ${agent.command || "n/a"}`;
-  node.querySelector(".session").textContent = `工位档案: ${agent.session_id || "n/a"} · 刚更新于 ${fmtTs(agent.updated_at)}`;
+  const matchSource = matchSourceLabels[agent.match_source] || agent.match_source || "未知";
+  node.querySelector(".session").textContent = `工位档案: ${agent.session_id || "n/a"} · 匹配: ${matchSource} · 刚更新于 ${fmtTs(agent.updated_at)}`;
+  const cmuxBits = [
+    agent.cmux_workspace_name || agent.cmux_workspace_id,
+    agent.cmux_surface_id || agent.cmux_surface_ref,
+  ].filter(Boolean);
+  node.querySelector(".cmux").textContent = `CMUX: ${cmuxBits.length ? cmuxBits.join(" · ") : "n/a"}`;
 
   const feedback = node.querySelector(".action-feedback");
   const setFeedback = (msg, cls = "") => {

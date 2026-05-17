@@ -4,6 +4,7 @@
   "aliases_file": "session_aliases.json",
   "credentials_file": "credentials.enc.json",
   "send_mode": "stdin",
+  "session_overrides": {},
   "dashboard": {
     "agent_types": ["codex", "claude", "droid"],
     "hide_empty_tools": true

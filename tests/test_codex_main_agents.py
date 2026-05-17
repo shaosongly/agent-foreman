@@ -175,6 +175,42 @@ class CodexMainAgentTests(unittest.TestCase):
 
         self.assertNotIn(1, matched)
 
+    def test_session_override_wins_by_workspace_name(self):
+        proc = monitor_server.ProcInfo(
+            pid=1,
+            ppid=0,
+            stat="S+",
+            etimes=100,
+            cpu=0.0,
+            mem=0.0,
+            args="codex",
+            cwd="/repo",
+            agent_type="codex",
+            start_ts=1000,
+            session_id="auto-session",
+            cmux_workspace_id="workspace-123",
+            cmux_surface_ref="surface:2",
+            match_source="cmux_tag",
+        )
+
+        applied = monitor_server.apply_session_overrides(
+            [proc],
+            {
+                "session_overrides": {
+                    "cmux_workspace_name:知识库构建": {
+                        "session_id": "manual-session",
+                        "alias": "知识库构建",
+                    }
+                }
+            },
+            {"workspace-123": "知识库构建"},
+        )
+
+        self.assertEqual(applied[1]["session_id"], "manual-session")
+        self.assertEqual(proc.session_id, "manual-session")
+        self.assertEqual(proc.match_source, "manual_override")
+        self.assertEqual(proc.override_alias, "知识库构建")
+
     def test_parse_codex_session_marks_final_answer_as_result_to_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "rollout-main.jsonl"

@@ -39,23 +39,30 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertEqual(names["CF7534E1-8C81-4659-A90A-BDAF283EE40A"], "IOS开发")
 
     @mock.patch.object(monitor_server.subprocess, "run")
-    def test_list_cmux_process_contexts_reads_codex_tag_session_id(self, run_mock):
+    def test_list_cmux_process_contexts_propagates_parent_chain(self, run_mock):
         run_mock.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
             stdout=(
                 "0.1\t49790976\t1\tprocess\t28760\t"
+                "surface:2\tlogin\n"
+                "0.1\t49790976\t1\tprocess\t28761\t28760\tzsh\n"
+                "0.1\t49790976\t1\tprocess\t28762\t28761\tcodex\n"
+                "0.1\t49790976\t1\tprocess\t28762\t"
                 "workspace:F3A4C221-2C13-4166-AAB1-A242861C4F99:tag:codex.019e3015-671b-7ec2-a133-1cf4a7b77c99\tcodex\n"
-                "0.1\t49790976\t1\tprocess\t28760\tsurface:2\tcodex\n"
+                "0.1\t49790976\t1\tprocess\t28763\t28762\tnode\n"
             ),
             stderr="",
         )
 
         contexts = monitor_server.list_cmux_process_contexts()
 
-        self.assertEqual(contexts[28760]["workspace_id"], "F3A4C221-2C13-4166-AAB1-A242861C4F99")
-        self.assertEqual(contexts[28760]["session_id"], "019e3015-671b-7ec2-a133-1cf4a7b77c99")
-        self.assertEqual(contexts[28760]["surface_ref"], "surface:2")
+        self.assertEqual(contexts[28762]["workspace_id"], "F3A4C221-2C13-4166-AAB1-A242861C4F99")
+        self.assertEqual(contexts[28762]["session_id"], "019e3015-671b-7ec2-a133-1cf4a7b77c99")
+        self.assertEqual(contexts[28762]["surface_ref"], "surface:2")
+        self.assertEqual(contexts[28763]["workspace_id"], "F3A4C221-2C13-4166-AAB1-A242861C4F99")
+        self.assertEqual(contexts[28763]["session_id"], "019e3015-671b-7ec2-a133-1cf4a7b77c99")
+        self.assertEqual(contexts[28763]["surface_ref"], "surface:2")
 
     def test_frontend_uses_markdown_renderer_and_workspace_title(self):
         js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -68,6 +75,8 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn("toolStatusFilters", js)
         self.assertIn("toggleToolStatusFilter(tool, status)", js)
         self.assertIn("chip.disabled = count === 0", js)
+        self.assertIn("matchSourceLabels", js)
+        self.assertIn("agent.cmux_surface_ref", js)
         css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         self.assertIn("repeat(auto-fit", css)
         self.assertIn("980px", css)
@@ -82,12 +91,15 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn("dashboard.agent_types", doc)
         self.assertIn("codex-auto-review", doc)
         self.assertIn("Markdown", doc)
+        self.assertIn("session_overrides", doc)
+        self.assertIn("CMUX tag", doc)
 
     def test_local_cmux_example_defaults_to_codex_only(self):
         config = (ROOT / "config.local-cmux.example.json").read_text(encoding="utf-8")
 
         self.assertIn('"agent_types": ["codex"]', config)
         self.assertIn('"hide_empty_tools": true', config)
+        self.assertIn('"session_overrides": {}', config)
 
 
 if __name__ == "__main__":
