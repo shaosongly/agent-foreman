@@ -773,6 +773,44 @@ def list_cmux_workspace_names() -> dict[str, str]:
     return names
 
 
+def list_cmux_process_contexts() -> dict[int, dict[str, str]]:
+    try:
+        proc = subprocess.run(
+            ["cmux", "top", "--all", "--processes", "--flat", "--format", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    contexts: dict[int, dict[str, str]] = defaultdict(dict)
+    tag_re = re.compile(
+        r"workspace:([0-9A-F-]+):tag:codex\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        re.IGNORECASE,
+    )
+    surface_re = re.compile(r"^surface:(\d+)$", re.IGNORECASE)
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6 or parts[3] != "process":
+            continue
+        try:
+            pid = int(parts[4])
+        except ValueError:
+            continue
+        parent = parts[5]
+        tag_match = tag_re.search(parent)
+        if tag_match:
+            contexts[pid]["workspace_id"] = tag_match.group(1)
+            contexts[pid]["session_id"] = tag_match.group(2)
+        surface_match = surface_re.match(parent)
+        if surface_match:
+            contexts[pid]["surface_ref"] = parent
+    return dict(contexts)
+
+
 def infer_agent_type(args: str) -> str:
     try:
         tokens = shlex.split(args)
@@ -1233,6 +1271,8 @@ class ProcInfo:
     agent_type: str
     start_ts: float
     session_id: str | None = None
+    cmux_workspace_id: str | None = None
+    cmux_surface_ref: str | None = None
 
 
 def _parse_etime(s: str) -> int:
@@ -1262,6 +1302,7 @@ def list_processes() -> list[ProcInfo]:
         cmd = ["ps", "-e", "-o", "pid=", "-o", "ppid=", "-o", "stat=",
                "-o", "etimes=", "-o", "pcpu=", "-o", "pmem=", "-o", "args="]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    cmux_contexts = list_cmux_process_contexts() if _IS_MACOS else {}
     now = utc_now_ts()
     entries: list[ProcInfo] = []
     for line in proc.stdout.splitlines():
@@ -1276,19 +1317,24 @@ def list_processes() -> list[ProcInfo]:
             et = _parse_etime(etimes) if _IS_MACOS else int(float(etimes))
         except Exception:
             et = 0
+        pid_int = int(pid)
+        cmux_context = cmux_contexts.get(pid_int, {})
+        command_session_id = extract_codex_session_id(args) if agent_type == "codex" else None
         entries.append(
             ProcInfo(
-                pid=int(pid),
+                pid=pid_int,
                 ppid=int(ppid),
                 stat=stat,
                 etimes=et,
                 cpu=float(cpu),
                 mem=float(mem),
                 args=args,
-                cwd=readlink_cwd(int(pid)),
+                cwd=readlink_cwd(pid_int),
                 agent_type=agent_type,
                 start_ts=now - et,
-                session_id=extract_codex_session_id(args) if agent_type == "codex" else None,
+                session_id=cmux_context.get("session_id") or command_session_id,
+                cmux_workspace_id=cmux_context.get("workspace_id"),
+                cmux_surface_ref=cmux_context.get("surface_ref"),
             )
         )
     return entries
@@ -1323,6 +1369,8 @@ def match_sessions(processes: list[ProcInfo], sessions: list[dict[str, Any]]) ->
             session = by_id[proc.session_id]
             out[proc.pid] = session
             used.add(proc.session_id)
+            continue
+        if proc.agent_type == "codex" and (proc.cmux_workspace_id or proc.cmux_surface_ref):
             continue
         cwd = proc.cwd
         if not cwd:

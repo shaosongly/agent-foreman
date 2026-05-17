@@ -145,6 +145,36 @@ class CodexMainAgentTests(unittest.TestCase):
 
         self.assertEqual(matched[1]["session_id"], "review-session")
 
+    def test_match_sessions_does_not_guess_cmux_codex_session_by_cwd(self):
+        proc = monitor_server.ProcInfo(
+            pid=1,
+            ppid=0,
+            stat="S+",
+            etimes=100,
+            cpu=0.0,
+            mem=0.0,
+            args="codex",
+            cwd="/repo",
+            agent_type="codex",
+            start_ts=1000,
+            session_id=None,
+            cmux_workspace_id="workspace-123",
+            cmux_surface_ref="surface:2",
+        )
+        sessions = [
+            {
+                "session_id": "other-session",
+                "session_kind": "main",
+                "cwd": "/repo",
+                "start_ts": 1002,
+                "heartbeat_ts": 1002,
+            }
+        ]
+
+        matched = monitor_server.match_sessions([proc], sessions)
+
+        self.assertNotIn(1, matched)
+
     def test_parse_codex_session_marks_final_answer_as_result_to_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "rollout-main.jsonl"

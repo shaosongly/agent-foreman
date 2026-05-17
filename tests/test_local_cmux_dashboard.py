@@ -38,6 +38,25 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertEqual(names["8B058AF7-1210-4880-8257-96EC5C656581"], "知识库构建")
         self.assertEqual(names["CF7534E1-8C81-4659-A90A-BDAF283EE40A"], "IOS开发")
 
+    @mock.patch.object(monitor_server.subprocess, "run")
+    def test_list_cmux_process_contexts_reads_codex_tag_session_id(self, run_mock):
+        run_mock.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "0.1\t49790976\t1\tprocess\t28760\t"
+                "workspace:F3A4C221-2C13-4166-AAB1-A242861C4F99:tag:codex.019e3015-671b-7ec2-a133-1cf4a7b77c99\tcodex\n"
+                "0.1\t49790976\t1\tprocess\t28760\tsurface:2\tcodex\n"
+            ),
+            stderr="",
+        )
+
+        contexts = monitor_server.list_cmux_process_contexts()
+
+        self.assertEqual(contexts[28760]["workspace_id"], "F3A4C221-2C13-4166-AAB1-A242861C4F99")
+        self.assertEqual(contexts[28760]["session_id"], "019e3015-671b-7ec2-a133-1cf4a7b77c99")
+        self.assertEqual(contexts[28760]["surface_ref"], "surface:2")
+
     def test_frontend_uses_markdown_renderer_and_workspace_title(self):
         js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
@@ -51,6 +70,7 @@ class LocalCmuxDashboardTests(unittest.TestCase):
         self.assertIn("chip.disabled = count === 0", js)
         css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         self.assertIn("repeat(auto-fit", css)
+        self.assertIn("980px", css)
         self.assertIn("grid-template-areas:", css)
         self.assertIn('"hero recent actions"', css)
         self.assertIn(".status-count:disabled", css)

@@ -34,7 +34,9 @@ cmux send-key --workspace <workspace_id> --surface <surface_id> Enter
 
 ### Codex 主会话识别
 
-Codex 进程会优先从命令行里的 `codex resume <session_id>` 提取 session id，再去匹配 `~/.codex/sessions` 下的 jsonl 文件。这样同一个 cwd 下存在 auto-review / approval 子会话时，不会误把主 Agent 匹配到错误的 session。
+Codex 进程会优先从 CMUX 的进程视图里读取 `workspace:<id>:tag:codex.<session_id>`，把 session id 绑定到真实的 CMUX surface 进程 PID。拿不到 CMUX tag 时，再从命令行里的 `codex resume <session_id>` 提取 session id，最后才考虑非 CMUX 场景下的 cwd/start time 兜底匹配。
+
+对本机 CMUX Codex 来说，如果没有可靠的 session id，就不会仅凭 cwd/start time 猜测 session。这样多个 Codex 都在同一个目录下运行时，宁可只显示进程状态，也避免把某个 surface 的会话内容贴到另一个 Agent 卡片上。
 
 ### 辅助进程过滤
 

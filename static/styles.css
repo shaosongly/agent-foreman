@@ -774,9 +774,10 @@ input[type="search"] {
 
 .tool-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(680px, 100%), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(760px, 100%), 980px));
   gap: 12px;
   align-items: start;
+  justify-content: center;
 }
 
 .agent-card {
@@ -1034,7 +1035,7 @@ input[type="search"] {
 
 .recent-output {
   min-height: 126px;
-  max-height: 168px;
+  max-height: 220px;
   margin: 0;
   padding: 11px 12px;
   border: 2px solid var(--ink);
